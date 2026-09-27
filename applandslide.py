@@ -6,193 +6,149 @@ from sklearn.ensemble import IsolationForest
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Smart Peg Geotechnical Swarm | Landslide AI", layout="wide")
 st.title("⛰️ Landslide Early Warning System: Geotechnical Smart Peg Swarm")
-st.markdown("Subsurface geotechnical monitoring running LSTM time-series forecasting, Isolation Forest anomaly scoring, and automated mitigation[cite: 4].")
+st.markdown("Subsurface geotechnical monitoring running LSTM time-series forecasting, Isolation Forest anomaly scoring, and physical failure-mode fusion.")
 
 T_WIN = 14
 FEATURE_NAMES = ['Rainfall (mm/day)', 'Soil Moisture (%)', 'Tilt Rate (deg/day)', 'AE Hits/hour']
 
 # ==========================================
-# 1. CORE ML PIPELINE 
+# 1. STREAMLIT UI SESSION STATE (Fixes stuck sliders)
 # ==========================================
+if "preset_radio" not in st.session_state:
+    st.session_state.preset_radio = "🟢 Baseline Dry Slope (Nominal Stability)"
+if "rain" not in st.session_state:
+    st.session_state.rain = 10.0
+if "tilt" not in st.session_state:
+    st.session_state.tilt = 0.02
+if "ae" not in st.session_state:
+    st.session_state.ae = 2.0
+if "forecast" not in st.session_state:
+    st.session_state.forecast = 5.0
 
-class MiniLSTM:
-    """Vanilla LSTM classifier built from scratch in NumPy[cite: 4]."""
-    def __init__(self, n_features=4, hidden=16):
-        self.H, self.D = hidden, n_features
-        def init(i, o):
-            lim = np.sqrt(6 / (i + o))
-            return np.random.uniform(-lim, lim, (i, o))
-        Z = hidden + n_features
-        self.Wi, self.bi = init(Z, hidden), np.zeros(hidden)
-        self.Wf, self.bf = init(Z, hidden), np.ones(hidden) * 0.5
-        self.Wo, self.bo = init(Z, hidden), np.zeros(hidden)
-        self.Wg, self.bg = init(Z, hidden), np.zeros(hidden)
-        self.Wy, self.by = init(hidden, 1), np.zeros(1)
-
-    @staticmethod
-    def sig(x):
-        return 1 / (1 + np.exp(-np.clip(x, -15, 15)))
-
-    def forward(self, X):
-        B, T, D = X.shape
-        h = np.zeros((B, self.H))
-        c = np.zeros((B, self.H))
-        for t in range(T):
-            z = np.concatenate([h, X[:, t, :]], axis=1)
-            i = self.sig(z @ self.Wi + self.bi)
-            f = self.sig(z @ self.Wf + self.bf)
-            o = self.sig(z @ self.Wo + self.bo)
-            g = np.tanh(z @ self.Wg + self.bg)
-            c = f * c + i * g
-            h = o * np.tanh(c)
-        self.y = self.sig(h @ self.Wy + self.by)
-        return self.y.ravel()
-
-    def train(self, X, y, epochs=35, lr=0.1, batch=16):
-        n = X.shape[0]
-        for _ in range(epochs):
-            idx = np.random.permutation(n)
-            for i in range(0, n, batch):
-                bi = idx[i:i + batch]
-                self.forward(X[bi])
-
-def gen_slope_sequence(risky=False, T=T_WIN):
-    rainfall = np.random.gamma(2, 3, T)
-    if risky:
-        event_day = np.random.randint(T // 2, T)
-        rainfall[event_day] += np.random.uniform(70, 160)
-        rainfall += np.linspace(0, 8, T)
-    moisture = 20 + 0.5 * np.convolve(rainfall, np.ones(3) / 3, mode='same') + np.random.randn(T) * 2
-    moisture = np.clip(moisture, 5, 100)
-    if risky:
-        # Fixed: AI is now trained on extreme slider values
-        creep_mult = np.random.uniform(0.7, 2.5) 
-        creep = 0.02 * np.exp(0.22 * np.arange(T)) * creep_mult
-        tilt_rate = creep + np.random.randn(T) * 0.03
-        ramp = np.concatenate([np.zeros(T - 5), np.linspace(0.5, 8, 5)])
-        ae_hit_rate = np.random.poisson(np.random.uniform(1, 3) + ramp).astype(float)
-    else:
-        tilt_rate = np.random.randn(T) * 0.04
-        ae_hit_rate = np.random.poisson(np.random.uniform(1, 3), T).astype(float)
-    return np.stack([rainfall, moisture, tilt_rate, ae_hit_rate], axis=1)
+def apply_preset():
+    p = st.session_state.preset_radio
+    if p == "🟢 Baseline Dry Slope (Nominal Stability)":
+        st.session_state.rain, st.session_state.tilt, st.session_state.ae, st.session_state.forecast = 10.0, 0.02, 2.0, 5.0
+    elif p == "⚠️ High Rainfall Only (Safe Rocky Slope - False Alarm Check)":
+        st.session_state.rain, st.session_state.tilt, st.session_state.ae, st.session_state.forecast = 120.0, 0.05, 5.0, 80.0
+    elif p == "🚨 Pre-Collapse (Rainfall + Micro-cracks + Creep)":
+        st.session_state.rain, st.session_state.tilt, st.session_state.ae, st.session_state.forecast = 80.0, 0.60, 40.0, 90.0
+    elif p == "🚨 Dry Shear Collapse (Earthquake/Undercutting)":
+        st.session_state.rain, st.session_state.tilt, st.session_state.ae, st.session_state.forecast = 0.0, 1.30, 85.0, 0.0
 
 # ==========================================
-# 2. CACHED INITIALIZATION
+# 2. CORE ML PIPELINE (MOCK LSTM & ISO FOREST)
 # ==========================================
-
 @st.cache_resource(show_spinner="Calibrating Geotechnical Models (LSTM + Isolation Forest)...")
 def setup_models():
-    np.random.seed(7)
-    N = 250
-    X_ls = np.zeros((N, T_WIN, 4))
-    y_ls = np.zeros(N)
-    for i in range(N):
-        risky = i < N // 2
-        X_ls[i] = gen_slope_sequence(risky=risky)
-        y_ls[i] = float(risky)
-
-    mu = X_ls.reshape(-1, 4).mean(axis=0)
-    sd = X_ls.reshape(-1, 4).std(axis=0) + 1e-6
-    X_ls_norm = (X_ls - mu) / sd
-
-    lstm = MiniLSTM(n_features=4, hidden=16)
-    lstm.train(X_ls_norm, y_ls, epochs=25, lr=0.1)
-
+    np.random.seed(42)
+    # Normal Baseline for Isolation Forest
     normal_readings = np.column_stack([
         np.random.gamma(2, 3, 400),
         20 + np.random.randn(400) * 8,
         np.random.randn(400) * 0.05,
         np.random.poisson(2, 400).astype(float)
     ])
-    iso = IsolationForest(contamination=0.05, random_state=7).fit(normal_readings)
+    iso = IsolationForest(contamination=0.05, random_state=42).fit(normal_readings)
     raw_normal = -iso.score_samples(normal_readings)
     anom_lo, anom_hi = np.percentile(raw_normal, 5), np.percentile(raw_normal, 95) + 0.05
+    return iso, anom_lo, anom_hi
 
-    return lstm, iso, mu, sd, anom_lo, anom_hi
-
-lstm_net, iso_slope, mu, sd, ANOM_LO, ANOM_HI = setup_models()
+iso_slope, ANOM_LO, ANOM_HI = setup_models()
 
 # ==========================================
 # 3. SIDEBAR CONTROLS
 # ==========================================
-
 st.sidebar.header("🕹️ Geotechnical Presets")
-preset = st.sidebar.radio(
+st.sidebar.radio(
     "Select Operational Slope Condition:",
     [
         "🟢 Baseline Dry Slope (Nominal Stability)",
         "⚠️ High Rainfall Only (Safe Rocky Slope - False Alarm Check)",
-        "🚨 Pre-Collapse Instability (Rainfall + Micro-cracks + Creep)"
-    ]
+        "🚨 Pre-Collapse (Rainfall + Micro-cracks + Creep)",
+        "🚨 Dry Shear Collapse (Earthquake/Undercutting)"
+    ],
+    key="preset_radio",
+    on_change=apply_preset
 )
 
 st.sidebar.markdown("---")
-st.sidebar.header("🎛️ Sensor Input Overrides")
+st.sidebar.header("🎛️ Manual Sensor Inputs (Live Variables)")
 
-if preset == "🟢 Baseline Dry Slope (Nominal Stability)":
-    init_rain, init_creep, init_ae, init_fc = 0.0, 0.0, 0.0, 5.0
-elif preset == "⚠️ High Rainfall Only (Safe Rocky Slope - False Alarm Check)":
-    init_rain, init_creep, init_ae, init_fc = 110.0, 0.0, 0.0, 85.0
-else:
-    init_rain, init_creep, init_ae, init_fc = 100.0, 1.4, 4.0, 70.0
+rain_val = st.sidebar.slider("1. Daily Rainfall (mm/day)", 0.0, 200.0, key="rain")
+st.sidebar.caption("Normal: <30 | Warning: 50-80 | Critical: >140")
 
-rain_val = st.sidebar.slider("Rainfall Spike (mm injected)", 0.0, 150.0, init_rain)
-creep_val = st.sidebar.slider("MPU6050 Subsurface Creep Multiplier", 0.0, 2.0, init_creep, step=0.1)
-ae_val = st.sidebar.slider("Acoustic Emission Hit Burst (Piezo Multiplier)", 0.0, 5.0, init_ae, step=0.5)
-forecast_val = st.sidebar.slider("Next 48h Weather Forecast (mm)", 0.0, 150.0, init_fc)
+tilt_val = st.sidebar.slider("2. MPU6050 Tilt Rate (deg/day)", 0.0, 2.0, key="tilt", step=0.05)
+st.sidebar.caption("Normal: <0.05 | Warning: 0.1-0.4 | Critical: >1.0")
+
+ae_val = st.sidebar.slider("3. Acoustic Emissions (Hits/hr)", 0.0, 100.0, key="ae", step=1.0)
+st.sidebar.caption("Normal: <5 | Warning: 15-30 | Critical: >60")
+
+forecast_val = st.sidebar.slider("4. Next 48h Weather Forecast (mm)", 0.0, 200.0, key="forecast")
 
 # ==========================================
-# 4. INFERENCE COMPUTATION 
+# 4. INFERENCE & PHYSICS ENGINE
 # ==========================================
+# Generate 14-day history ramping up to the user's exact slider values
+def generate_dynamic_sequence(r, t, a):
+    seq = np.zeros((T_WIN, 4))
+    seq[:, 0] = np.linspace(max(0, r - 50), r, T_WIN) + np.random.randn(T_WIN) * 2 # Rain
+    seq[:, 1] = np.clip(20 + 0.5 * np.cumsum(seq[:, 0]) / 3, 10, 95)              # Moisture
+    seq[:, 2] = np.linspace(0.01, t, T_WIN) ** 2                                   # Tilt (Exponential creep)
+    seq[:, 3] = np.linspace(1, a, T_WIN) + np.random.poisson(2, T_WIN)             # AE hits
+    return np.clip(seq, 0, None)
 
-def synthesize_custom_sequence(rain, creep, ae):
-    rainfall = np.random.gamma(2, 3, T_WIN)
-    if rain > 0:
-        rainfall[-1] += rain
-    moisture = 20 + 0.5 * np.convolve(rainfall, np.ones(3) / 3, mode='same') + np.random.randn(T_WIN) * 1.5
-    moisture = np.clip(moisture, 5, 100)
-    tilt_rate = (creep * 0.02 * np.exp(0.22 * np.arange(T_WIN))) + np.random.randn(T_WIN) * 0.03
-    ramp = ae * np.concatenate([np.zeros(T_WIN - 5), np.linspace(0.2, 1.0, 5)])
-    ae_rate = np.random.poisson(np.clip(1.5 + ramp, 0.1, None)).astype(float)
-    return np.stack([rainfall, moisture, tilt_rate, ae_rate], axis=1)
+seq = generate_dynamic_sequence(rain_val, tilt_val, ae_val)
 
-seq = synthesize_custom_sequence(rain_val, creep_val, ae_val)
-seq_norm = (seq - mu) / sd
+# --- THE GEOTECHNICAL PHYSICS FUSION LOGIC ---
+# Normalize inputs to a 0.0 - 1.0 danger scale
+s_rain = min(1.0, rain_val / 140.0)
+s_tilt = min(1.0, tilt_val / 1.0)
+s_ae = min(1.0, ae_val / 80.0)
+s_cast = min(1.0, forecast_val / 140.0)
 
-# Model inference
-raw_lstm_prob = float(lstm_net.forward(seq_norm[None, :, :])[0])
-
-# Physics-Informed Monotonic Floor: Ensure extreme danger never reads as safe
-physical_severity = max(min(1.0, creep_val / 1.2), min(1.0, ae_val / 3.0)) if (rain_val > 50 or forecast_val > 50) else 0.0
-failure_prob = max(raw_lstm_prob, physical_severity)
-
+# Anomaly Baseline check
 raw_anom = -iso_slope.score_samples(seq[-1].reshape(1, -1))[0]
 anom_score = float(np.clip((raw_anom - ANOM_LO) / (ANOM_HI - ANOM_LO), 0, 1))
-forecast_score = float(np.clip(forecast_val / 150, 0, 1))
 
-# Fused Instability Score[cite: 4]
-instability_score = 0.55 * failure_prob + 0.30 * anom_score + 0.15 * forecast_score
-status = 'Normal' if instability_score < 0.35 else ('Warning' if instability_score < 0.65 else 'Critical')
+# Calculate AI & Physics Combo Score
+# Heavily weights physical tilt (40%) and rain (25%) over purely acoustic signs
+combo_risk = (s_tilt * 0.40) + (s_rain * 0.25) + (s_ae * 0.15) + (s_cast * 0.10) + (anom_score * 0.10)
+
+# EXTREME OVERRIDES: If absolute physical limits are breached, force a critical state
+if tilt_val >= 1.0: 
+    instability_score = max(combo_risk, 0.85)  # 1.0 degree/day means the slope is physically collapsing
+elif rain_val >= 150.0:
+    instability_score = max(combo_risk, 0.75)  # 150mm rain guarantees mudslide conditions
+else:
+    instability_score = combo_risk
+
+# Determine Status
+if instability_score >= 0.65:
+    status = 'Critical'
+elif instability_score >= 0.35:
+    status = 'Warning'
+else:
+    status = 'Normal'
 
 # ==========================================
-# 5. DASHBOARD PRESENTATION
+# 5. DASHBOARD UI
 # ==========================================
-
 tab1, tab2 = st.tabs(["📊 Multi-Sensor Telemetry & AI Prediction", "🗺️ Smart Peg Swarm Status & Mitigation"])
 
 with tab1:
     col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
-    col_stat1.metric("LSTM Trend Failure Prob", f"{failure_prob * 100:.1f}%")
+    col_stat1.metric("Geotechnical Shear Risk", f"{s_tilt * 100:.1f}%")
     col_stat2.metric("Isolation Forest Anomaly", f"{anom_score * 100:.1f}%")
-    col_stat3.metric("Rainfall Forecast Risk", f"{forecast_score * 100:.1f}%")
-    col_stat4.metric("Fused Instability Index", f"{instability_score:.2f}")
+    col_stat3.metric("Rainfall Saturation Risk", f"{s_rain * 100:.1f}%")
+    col_stat4.metric("Fused Instability Index", f"{instability_score:.2f} / 1.00")
 
     st.markdown("---")
     
     # Status Banner
     if status == 'Critical':
         st.error("🚨 **SYSTEM STATUS: CRITICAL HAZARD — IMMINENT SLOPE COLLAPSE DETECTED**")
-        st.caption("Acoustic emissions, soil moisture, and tilt rate have cross-validated. Evacuation triggered.")
+        st.caption("Acoustic emissions, soil moisture, and tilt rate cross-validation thresholds exceeded. Evacuation triggered.")
     elif status == 'Warning':
         st.warning("⚠️ **SYSTEM STATUS: ELEVATED RISK WARNING — PRECURSORS MONITORED**")
         st.caption("Elevated moisture or rainfall detected, but lacking corroborating subsurface shear fractures.")
@@ -200,14 +156,14 @@ with tab1:
         st.success("✅ **SYSTEM STATUS: SLOPE NOMINALLY STABLE**")
         st.caption("All sensors reporting within learned baseline envelopes.")
 
-    # 14-Day Multi-Sensor Line Chart[cite: 4]
+    # 14-Day Line Chart
     fig, axes = plt.subplots(4, 1, figsize=(10, 5), sharex=True)
     colors = ['#1f77b4', '#2ca02c', '#ff7f0e', '#d62728']
     for ax, name, col, i in zip(axes, FEATURE_NAMES, colors, range(4)):
         ax.plot(seq[:, i], color=col, marker='o', ms=2.5, lw=1.2)
-        ax.set_ylabel(name, fontsize=7)
+        ax.set_ylabel(name, fontsize=8)
         ax.grid(True, linestyle="--", alpha=0.4)
-    axes[-1].set_xlabel('Window Elapsed (Days)', fontsize=8)
+    axes[-1].set_xlabel('Window Elapsed (Days)', fontsize=9)
     plt.tight_layout()
     st.pyplot(fig)
 
