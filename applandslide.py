@@ -12,7 +12,7 @@ T_WIN = 14
 FEATURE_NAMES = ['Rainfall (mm/day)', 'Soil Moisture (%)', 'Tilt Rate (deg/day)', 'AE Hits/hour']
 
 # ==========================================
-# 1. CORE ML PIPELINE (FROM NOTEBOOK)
+# 1. CORE ML PIPELINE 
 # ==========================================
 
 class MiniLSTM:
@@ -54,21 +54,22 @@ class MiniLSTM:
             idx = np.random.permutation(n)
             for i in range(0, n, batch):
                 bi = idx[i:i + batch]
-                # Forward pass optimization
                 self.forward(X[bi])
 
 def gen_slope_sequence(risky=False, T=T_WIN):
     rainfall = np.random.gamma(2, 3, T)
     if risky:
         event_day = np.random.randint(T // 2, T)
-        rainfall[event_day] += np.random.uniform(80, 150)
+        rainfall[event_day] += np.random.uniform(70, 160)
         rainfall += np.linspace(0, 8, T)
     moisture = 20 + 0.5 * np.convolve(rainfall, np.ones(3) / 3, mode='same') + np.random.randn(T) * 2
     moisture = np.clip(moisture, 5, 100)
     if risky:
-        creep = 0.02 * np.exp(0.22 * np.arange(T)) * np.random.uniform(0.8, 1.3)
+        # Fixed: AI is now trained on extreme slider values
+        creep_mult = np.random.uniform(0.7, 2.5) 
+        creep = 0.02 * np.exp(0.22 * np.arange(T)) * creep_mult
         tilt_rate = creep + np.random.randn(T) * 0.03
-        ramp = np.concatenate([np.zeros(T - 5), np.linspace(0.5, 6, 5)])
+        ramp = np.concatenate([np.zeros(T - 5), np.linspace(0.5, 8, 5)])
         ae_hit_rate = np.random.poisson(np.random.uniform(1, 3) + ramp).astype(float)
     else:
         tilt_rate = np.random.randn(T) * 0.04
@@ -97,7 +98,6 @@ def setup_models():
     lstm = MiniLSTM(n_features=4, hidden=16)
     lstm.train(X_ls_norm, y_ls, epochs=25, lr=0.1)
 
-    # Train Baseline Isolation Forest
     normal_readings = np.column_stack([
         np.random.gamma(2, 3, 400),
         20 + np.random.randn(400) * 8,
@@ -113,7 +113,7 @@ def setup_models():
 lstm_net, iso_slope, mu, sd, ANOM_LO, ANOM_HI = setup_models()
 
 # ==========================================
-# 3. SIDEBAR: SCENARIOS & TELEMETRY CONTROLS
+# 3. SIDEBAR CONTROLS
 # ==========================================
 
 st.sidebar.header("🕹️ Geotechnical Presets")
@@ -142,7 +142,7 @@ ae_val = st.sidebar.slider("Acoustic Emission Hit Burst (Piezo Multiplier)", 0.0
 forecast_val = st.sidebar.slider("Next 48h Weather Forecast (mm)", 0.0, 150.0, init_fc)
 
 # ==========================================
-# 4. INFERENCE COMPUTATION
+# 4. INFERENCE COMPUTATION 
 # ==========================================
 
 def synthesize_custom_sequence(rain, creep, ae):
@@ -160,7 +160,12 @@ seq = synthesize_custom_sequence(rain_val, creep_val, ae_val)
 seq_norm = (seq - mu) / sd
 
 # Model inference
-failure_prob = float(lstm_net.forward(seq_norm[None, :, :])[0])
+raw_lstm_prob = float(lstm_net.forward(seq_norm[None, :, :])[0])
+
+# Physics-Informed Monotonic Floor: Ensure extreme danger never reads as safe
+physical_severity = max(min(1.0, creep_val / 1.2), min(1.0, ae_val / 3.0)) if (rain_val > 50 or forecast_val > 50) else 0.0
+failure_prob = max(raw_lstm_prob, physical_severity)
+
 raw_anom = -iso_slope.score_samples(seq[-1].reshape(1, -1))[0]
 anom_score = float(np.clip((raw_anom - ANOM_LO) / (ANOM_HI - ANOM_LO), 0, 1))
 forecast_score = float(np.clip(forecast_val / 150, 0, 1))
